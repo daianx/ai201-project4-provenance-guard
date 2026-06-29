@@ -403,8 +403,11 @@ def index():
 @limiter.limit("10 per minute;100 per day")
 def submit():
     """Endpoint for content submission and classification."""
-    data = request.get_json()
-    if not data or 'text' not in data or 'creator_id' not in data:
+    # Adding force=True makes it resilient to header issues
+    data = request.get_json(force=True) 
+    if not data:
+        return jsonify({"error": "No JSON provided"}), 400
+    if 'text' not in data or 'creator_id' not in data:
         return jsonify({"error": "Missing required fields: 'text', 'creator_id'"}), 400
 
     text = data['text']
@@ -536,11 +539,15 @@ def appeal():
 def log():
     """Endpoint to view the structured audit log."""
     content_id = request.args.get("content_id")
+    creator_id = request.args.get("creator_id")
     db = get_db()
     
     if content_id:
         query = "SELECT * FROM submissions WHERE content_id = ?"
         rows = db.execute(query, (content_id,)).fetchall()
+    elif creator_id:
+        query = "SELECT * FROM submissions WHERE creator_id = ? ORDER BY timestamp DESC"
+        rows = db.execute(query, (creator_id,)).fetchall()
     else:
         # Get 10 most recent
         query = "SELECT * FROM submissions ORDER BY timestamp DESC LIMIT 10"

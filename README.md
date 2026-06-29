@@ -213,6 +213,13 @@ Confidence: Low | The creator can file an appeal to add context or request a rev
 Our analysis found consistent patterns associated with AI-written text — uniform sentence structure, smooth phrasing, and low stylistic variation. This label is applied automatically and may not be accurate. The creator can appeal if this is incorrect.  
 Confidence: High | This does not mean the creator did anything wrong — many platforms allow AI-assisted work. Check the platform's content policy for details.
 
+
+| Variant                               | Condition           | Exact Label Text                                                                                                                                                                                                                                                                                                                     | Appeals Process                                                                                                                             |
+| :------------------------------------ | :------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Variant A — High-confidence human** | score < 0.40        | **✅ This content appears to be human-written.** Our analysis found strong signs of human authorship — things like varied sentence rhythm, distinctive word choices, and stylistic patterns that are hard to replicate consistently. Confidence: High                                                                                 | If this is wrong, the creator can file an appeal below.                                                                                     |
+| **Variant B — Uncertain**             | 0.40 ≤ score ≤ 0.65 | **⚠️ We're not sure about the origin of this content.** Our analysis found a mix of signals — some that look human-written and some that look AI-generated. We can't say with confidence either way. The creator may want to provide more context, or readers can weigh this themselves. Confidence: Low                             | The creator can file an appeal to add context or request a review.                                                                          |
+| **Variant C — High-confidence AI**    | score > 0.65        | **🤖 This content appears to have been AI-generated.** Our analysis found consistent patterns associated with AI-written text — uniform sentence structure, smooth phrasing, and low stylistic variation. This label is applied automatically and may not be accurate. The creator can appeal if this is incorrect. Confidence: High | This does not mean the creator did anything wrong — many platforms allow AI-assisted work. Check the platform's content policy for details. |
+
 ## **🛡️ Appeals Workflow**
 
 Any creator whose `creator_id` is associated with a submission can appeal that classification immediately — no waiting period.
@@ -268,7 +275,7 @@ The API uses in-memory limits via Flask-Limiter.
 |---|---|---|
 | POST | `/submit` | Submit text for attribution analysis. Requires `text` and `creator_id`. Optional: `content_type`, `metadata_text`. |
 | POST | `/appeal` | Contest a classification. Requires `content_id`, `creator_id`, and `reasoning`. |
-| GET | `/log` | View the audit log. Optional query param: `content_id` to filter by submission. |
+| GET | `/log` | View the audit log. Optional query param: `content_id` to filter by submission or `creator_id` to filter by creator. |
 | GET | `/dashboard` | View analytics metrics (total submissions, detection ratios, appeal rate). |
 | POST | `/verify_identity` | Request a Provenance Certificate. Requires `creator_id`. |
 
@@ -365,70 +372,65 @@ Structured logging is maintained in SQLite. Output from GET /log:
 }
 ```
 
+## **Evaluation Report**
+
+To validate the system against ground-truth labels, I ran a sample of 50 entries from the [AI vs Human Text Classification Dataset 2026](https://www.kaggle.com/datasets/alitaqishah/ai-vs-human-text-classification-dataset-2026) (Kaggle) through the live pipeline with the Groq API enabled. Samples were submitted with `creator_id` values indicating their known source: `user-human` for human-written samples, `user-gpt` for ChatGPT-generated samples, and `user-gemini` for Gemini-generated samples.
+
+### **Results by Source**
+
+| Source | Samples | Correct | False Positive | False Negative | Uncertain | Accuracy |
+|---|---|---|---|---|---|---|
+| `user-human` | 31 | 12 ✅ | 19 ❌ (flagged as AI) | — | 0 | 39% |
+| `user-gpt` | 7 | 5 ✅ | — | 2 ❌ (flagged as human) | 0 | 71% |
+| `user-gemini` | 12 | 7 ✅ | — | 4 ❌ (flagged as human) | 1 | 58% |
+| **Total** | **50** | **24** | **19** | **6** | **1** | **48%** |
+
+### **Key Metrics**
+
+| Metric | Value |
+|---|---|
+| Total Submissions | 50 |
+| AI Detection Ratio | 0.62 |
+| Human Detection Ratio | 0.36 |
+| Uncertain Ratio | 0.02 |
+| Avg Confidence Score | 0.60 |
+| Disagreement Penalty Triggered | 18 / 50 (36%) |
+| False Positive Rate (human → AI) | 61% |
+| False Negative Rate (AI → human) | 32% |
+
+
+### **Observations**
+
+**Overall accuracy is 48%, with a strong bias toward labelling text as AI.** The system performed better on AI-generated text (71% for GPT, 58% for Gemini) than on human text (39%). This is the opposite of the intended design — the asymmetric thresholds were meant to make false positives *less* likely, not more. The results expose two underlying issues.
+
+**Issue 1 — LLM scores are clustering at exactly 0.2 or 0.8.** Every sample received an LLM score of either 0.20 or 0.80 with almost no variation in between. The chain-of-thought prompt is causing the model to snap to extremes before committing to a number, rather than producing a calibrated continuous score. A score of 0.80 combined with even a modest stylometric signal (0.67+) always produces a final confidence above 0.65, landing in the AI band. This single issue is responsible for the majority of false positives.
+
+**Issue 2 — Stylometric scores are uniformly high across all text types.** Every sample in the dataset — human or AI — scored between 0.65 and 1.0 on the stylometric signal. This suggests the baseline calibration for the four sub-metrics is skewed: the thresholds for what counts as "AI-like" sentence variance and punctuation density are set too low, flagging most text as structurally uniform regardless of origin.
+
+**The disagreement penalty fired on 36% of submissions** but couldn't fully compensate — when the LLM scores a human text at 0.8 and stylometrics scores it at 0.75, the signals agree on the wrong answer and no penalty is applied.
+
+**What this means for deployment:** These results are a useful calibration signal. The LLM prompt needs to be revised to encourage fractional scores (e.g., explicitly asking for values across the full 0–1 range with examples like 0.35, 0.62, 0.78). The stylometric baselines need recalibration against a larger reference corpus — the current thresholds were set by reasoning, not by fitting to data, which is the limitation described in the Known Limitations section. Despite the accuracy gap, the system correctly identified all clearly AI-generated texts with high structural uniformity and correctly flagged informal human writing (social media posts, casual blog entries) as human.
+
+
 ## **⚠️ Known Limitations**
 
 1. **Stylistically Simple Human Poetry:** A haiku will have near-zero sentence variance and no punctuation. The stylometric signal heavily flags this as AI. While the disagreement penalty catches this and stops a false positive, it results in an "Uncertain" label rather than correctly identifying it as Human.  
-2. **Lightly Edited AI Output:** If a user edits ~25% of an AI draft, structural variance rises (scoring Human on stylometrics), while the semantic tone remains AI. The system struggles with this "cyborg" writing.  
+2. **Lightly Edited AI Output:** If a user edits \~25% of an AI draft, structural variance rises (scoring Human on stylometrics), while the semantic tone remains AI. The system struggles with this "cyborg" writing.  
 3. **Non-English Text:** The stylometric baselines and the LLM prompt are calibrated for English prose. Text in other languages would produce unreliable scores across all signals, and the transparency labels are English-only.
 
 ### **What I'd Change for Real Deployment**
 
 The current system is a prototype. In production, three things would need to change.
 
-First, the **signal weights should be learned, not hardcoded**. The 0.60/0.40 split and the 0.35 disagreement threshold were chosen by reasoning and hardcoding, not by fitting to data and learning from it. A production system would collect labeled examples (confirmed human, confirmed AI) and use logistic regression or a small calibration model to learn optimal weights and thresholds from actual detection outcomes.
+First, the **signal weights should be learned, not hardcoded**. The 0.60/0.40 split and the 0.35 disagreement threshold were chosen by reasoning, not by fitting to data. A production system would collect labeled examples (confirmed human, confirmed AI) and use logistic regression or a small calibration model to learn optimal weights and thresholds from actual detection outcomes.
 
 Second, the **stylometric baselines need per-genre calibration**. Poetry, technical documentation, and blog posts have fundamentally different structural profiles. A single set of baselines treats a haiku and a 2000-word essay the same way, which is why poetry is a known failure mode. A production system would maintain genre-specific baseline distributions and select the right one based on a `content_type` hint or an automatic genre classifier.
 
 Third, the **LLM signal should use a fine-tuned classifier, not a general-purpose prompt**. The current chain-of-thought approach works because LLaMA 3.3 is a strong general model, but a model fine-tuned specifically on human-vs-AI classification tasks would produce more calibrated scores with less variance across runs. This would also reduce the token cost per call since a fine-tuned model doesn't need the reasoning preamble.
 
-## **Evaluation Report**
-
-To validate that the system produces meaningful, varied results, I ran 15 distinct submissions through the live pipeline (Groq API enabled) covering a range of content types. Rate-limit test entries are excluded from this analysis.
-
-### **Test Submissions & Results**
-
-| # | Input Type | llm\_score | stylo\_score | ensemble | confidence | Verdict |
-|---|---|---|---|---|---|---|
-| 1 | AI essay ("paradigm shift") | 0.80 | 0.87 | 0.00 | **0.81** | 🤖 High-Confidence AI |
-| 2 | AI technical writing (harness engineering) | 0.80 | 0.51 | 0.71 | **0.68** | 🤖 High-Confidence AI |
-| 3 | Human casual ("ramen place, idk") | 0.20 | 0.62 | 1.00 | **0.24** | ✅ High-Confidence Human |
-| 4 | Human DIY tutorial (kitchen sink) | 0.20 | 0.37 | 0.98 | **0.27** | ✅ High-Confidence Human |
-| 5 | Human creative fiction (engine sputtered) | 0.20 | 0.63 | 0.21 | **0.40** | ⚠️ Uncertain |
-| 6 | Human haiku ("Rain falls on the roof") | 0.80 | 0.97 | 0.95 | **0.82** | 🤖 High-Confidence AI ⚠️ |
-| 7 | Human parking rant (casual, angry) | 0.20 | 0.58 | 1.00 | **0.53** | ⚠️ Uncertain |
-| 8 | Human lighthouse story (appealed) | 0.60 | 0.59 | 0.27 | **0.60** | ⚠️ Uncertain |
-| 9 | Verified human creator (poet\_jane) | 0.20 | 0.87 | 0.98 | **0.27** | 🛡️ Verified Human |
-| 10 | Image with AI metadata (unverified) | 0.70 | 0.88 | 0.50 | **0.77** | 🤖 High-Confidence AI |
-
-### **Key Metrics**
-
-| Metric | Value |
-|---|---|
-| Total Submissions (excl. rate-limit tests) | 15 |
-| AI Detection Ratio | 0.53 |
-| Human Detection Ratio | 0.20 |
-| Uncertain Ratio | 0.27 |
-| Appeal Rate | 0.07 |
-| Avg Confidence Score | 0.60 |
-| Disagreement Penalty Triggered | 5 / 15 (33%) |
-| Verified Creator Submissions | 3 |
-
-### **Observations**
-
-**The signals disagree where they should.** Submission #5 (creative fiction) demonstrates the core design working correctly: the LLM read the narrative voice as human (0.20) while stylometrics flagged the even sentence structure as AI-like (0.63). The disagreement penalty pulled the combined score to 0.40 — the boundary of the uncertain band. The system expressed genuine doubt rather than forcing a verdict.
-
-**The haiku is a documented false positive.** Submission #6 is the most revealing result. The human-written haiku scored 0.82 (high-confidence AI) because both signals agreed on the wrong answer: the LLM read the minimalist structure as AI-like (0.80), and stylometrics scored the rigid, punctuation-free format at 0.97. No disagreement penalty fired because the signals didn't disagree — they were both wrong in the same direction. This is the exact edge case described in Known Limitations and is the strongest argument for why the appeals workflow exists.
-
-**High-confidence cases show strong signal agreement.** Submissions #1–2 (AI) and #3–4 (human) produced scores near the extremes (0.68–0.81 for AI, 0.24–0.27 for human) because both signals aligned. The casual human texts (#3, #4) scored low on both signals — the LLM recognized informal, personal writing, and stylometrics detected high sentence-length variance and punctuation diversity.
-
-**Verification shifts borderline results.** Submission #9 (poet\_jane, verified) scored 0.27 with the 🛡️ badge. The same text from an unverified creator would have scored 0.42 (the -0.15 verification adjustment pushed it from uncertain into the human band). This shows the Provenance Certificate working as intended — supplementing the classifier for borderline cases without overriding strong AI signals.
-
-**The appeal pathway caught a misclassification.** Submission #8 (lighthouse story) scored 0.60 — uncertain but AI-leaning. I appealed with reasoning: *"This piece was written by hand."* The status changed to `under_review` and the appeal is visible alongside the original scores in the audit log, giving a moderator the full picture.
-
-
 ## **📝 Spec Reflection**
 
-* **How the spec helped:** Defining the mathematical "Disagreement Penalty" thresholds *before* writing code saved me hours. Implementing combine_scores() was just translating my explicit English rules into a simple if/else block.  
+* **How the spec helped:** Defining the mathematical "Disagreement Penalty" thresholds *before* writing code saved me hours. Implementing combine\_scores() was just translating my explicit English rules into a simple if/else block.  
 * **How implementation diverged:** Originally, I planned a 2-signal system. During implementation, I realized I could easily plug in multiple extra signals. I diverged from the spec by building out a 3rd (Ensemble Burstiness) and 4th (Image Metadata) signal and dynamically adjusting weights, making the pipeline much more robust.
 
 ## **🤖 AI Usage**
@@ -471,3 +473,6 @@ How it's displayed: If a verified creator's adjusted score falls below 0.40, the
 ### **4. Analytics Dashboard**
 
 Added `GET /dashboard` returning four computed metrics: **Total Submissions** (volume), **AI-to-Human-to-Uncertain Detection Ratio** (what proportion of content falls into each classification bucket), **Appeal Rate** (how often creators contest a classification, serving as a proxy for false-positive frequency — a rising appeal rate signals the classifier may need recalibration), and **Average Confidence Score** (the mean confidence across all submissions, which tracks whether the system is producing decisive verdicts or trending toward uncertainty over time).
+
+## Demo
+https://youtu.be/OwyUTLagTAE
